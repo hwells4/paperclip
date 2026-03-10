@@ -99,6 +99,141 @@ async function buildSkillsDir(): Promise<{ dir: string; settingsFile: string | n
   return { dir: tmp, settingsFile };
 }
 
+// ---------------------------------------------------------------------------
+// Session initialization: fetch task context and auto-checkout before the
+// agent starts so it can skip the Paperclip heartbeat procedure and go
+// straight to doing work.
+// ---------------------------------------------------------------------------
+
+interface TaskContext {
+  identifier: string;
+  title: string;
+  description: string;
+  status: string;
+  priority: string;
+  comments: Array<{ author: string; body: string; createdAt: string }>;
+}
+
+async function paperclipFetch(
+  apiUrl: string,
+  path: string,
+  authToken: string,
+  opts?: { method?: string; body?: Record<string, unknown>; runId?: string },
+): Promise<unknown> {
+  const url = `${apiUrl}${path}`;
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${authToken}`,
+    "Content-Type": "application/json",
+  };
+  if (opts?.runId) {
+    headers["X-Paperclip-Run-Id"] = opts.runId;
+  }
+  const res = await fetch(url, {
+    method: opts?.method ?? "GET",
+    headers,
+    ...(opts?.body ? { body: JSON.stringify(opts.body) } : {}),
+  });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+async function initializeSession(input: {
+  apiUrl: string;
+  authToken: string;
+  agentId: string;
+  taskId: string;
+  runId: string;
+  onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+}): Promise<TaskContext | null> {
+  const { apiUrl, authToken, agentId, taskId, runId, onLog } = input;
+
+  try {
+    // 1. Checkout the issue (marks it in_progress)
+    await paperclipFetch(apiUrl, `/api/issues/${taskId}/checkout`, authToken, {
+      method: "POST",
+      body: { agentId, expectedStatuses: ["todo", "backlog", "in_progress"] },
+      runId,
+    });
+    await onLog("stderr", `[paperclip] Checked out issue ${taskId}\n`);
+
+    // 2. Fetch issue details
+    const issue = (await paperclipFetch(apiUrl, `/api/issues/${taskId}`, authToken)) as Record<
+      string,
+      unknown
+    > | null;
+    if (!issue) {
+      await onLog("stderr", `[paperclip] Failed to fetch issue ${taskId}\n`);
+      return null;
+    }
+
+    // 3. Fetch comments
+    const commentsRaw = (await paperclipFetch(
+      apiUrl,
+      `/api/issues/${taskId}/comments`,
+      authToken,
+    )) as Array<Record<string, unknown>> | null;
+
+    const comments = (commentsRaw ?? []).map((c) => ({
+      author: String(
+        c.authorAgent
+          ? (c.authorAgent as Record<string, unknown>).name ?? "agent"
+          : c.authorUser
+            ? (c.authorUser as Record<string, unknown>).name ?? "user"
+            : "unknown",
+      ),
+      body: String(c.body ?? ""),
+      createdAt: String(c.createdAt ?? ""),
+    }));
+
+    const taskContext: TaskContext = {
+      identifier: String(issue.identifier ?? ""),
+      title: String(issue.title ?? ""),
+      description: String(issue.description ?? ""),
+      status: String(issue.status ?? ""),
+      priority: String(issue.priority ?? ""),
+      comments,
+    };
+
+    await onLog(
+      "stderr",
+      `[paperclip] Injecting context for ${taskContext.identifier}: "${taskContext.title}"\n`,
+    );
+    return taskContext;
+  } catch (err) {
+    await onLog("stderr", `[paperclip] Session init failed: ${err}\n`);
+    return null;
+  }
+}
+
+function buildTaskContextBlock(task: TaskContext): string {
+  const lines: string[] = [
+    `\n\n---\n## Your Task: ${task.identifier} — ${task.title}\n`,
+    `**Status**: ${task.status} | **Priority**: ${task.priority}\n`,
+  ];
+
+  if (task.description.trim()) {
+    lines.push(`### Description\n\n${task.description}\n`);
+  }
+
+  if (task.comments.length > 0) {
+    lines.push(`### Comments\n`);
+    for (const c of task.comments) {
+      lines.push(`**${c.author}** (${c.createdAt}):\n${c.body}\n`);
+    }
+  }
+
+  lines.push(
+    `---`,
+    `\nThis task has been checked out for you. Do the work described above.`,
+    `When you're done, just finish your session — a stop hook will automatically post a summary and mark the task complete.`,
+    `You do NOT need to call the Paperclip API yourself.\n`,
+  );
+
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+
 interface ClaudeExecutionInput {
   runId: string;
   agent: AdapterExecutionContext["agent"];
@@ -366,7 +501,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${cwd}".\n`,
     );
   }
-  const prompt = renderTemplate(promptTemplate, {
+  let prompt = renderTemplate(promptTemplate, {
     agentId: agent.id,
     companyId: agent.companyId,
     runId,
@@ -375,6 +510,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     run: { id: runId, source: "on_demand" },
     context,
   });
+
+  // Session initialization: if woken for a specific task, fetch its context
+  // and inject it into the prompt so the agent can skip the heartbeat procedure.
+  const taskId = env.PAPERCLIP_TASK_ID;
+  const apiUrl = env.PAPERCLIP_API_URL;
+  const taskAuthToken = env.PAPERCLIP_API_KEY;
+  if (taskId && apiUrl && taskAuthToken) {
+    const taskContext = await initializeSession({
+      apiUrl,
+      authToken: taskAuthToken,
+      agentId: agent.id,
+      taskId,
+      runId,
+      onLog,
+    });
+    if (taskContext) {
+      prompt += buildTaskContextBlock(taskContext);
+    }
+  }
 
   const buildClaudeArgs = (resumeSessionId: string | null) => {
     const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
