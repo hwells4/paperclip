@@ -105,6 +105,14 @@ async function buildSkillsDir(): Promise<{ dir: string; settingsFile: string | n
 // straight to doing work.
 // ---------------------------------------------------------------------------
 
+interface TaskAttachment {
+  id: string;
+  originalFilename: string;
+  contentType: string;
+  byteSize: number;
+  contentUrl: string;
+}
+
 interface TaskContext {
   identifier: string;
   title: string;
@@ -112,6 +120,7 @@ interface TaskContext {
   status: string;
   priority: string;
   comments: Array<{ author: string; body: string; createdAt: string }>;
+  attachments: TaskAttachment[];
 }
 
 async function paperclipFetch(
@@ -185,6 +194,21 @@ async function initializeSession(input: {
       createdAt: String(c.createdAt ?? ""),
     }));
 
+    // 4. Fetch attachments
+    const attachmentsRaw = (await paperclipFetch(
+      apiUrl,
+      `/api/issues/${taskId}/attachments`,
+      authToken,
+    )) as Array<Record<string, unknown>> | null;
+
+    const attachments: TaskAttachment[] = (attachmentsRaw ?? []).map((a) => ({
+      id: String(a.id ?? ""),
+      originalFilename: String(a.originalFilename ?? ""),
+      contentType: String(a.contentType ?? ""),
+      byteSize: Number(a.byteSize ?? 0),
+      contentUrl: `${apiUrl}${String(a.contentPath ?? `/api/attachments/${a.id}/content`)}`,
+    }));
+
     const taskContext: TaskContext = {
       identifier: String(issue.identifier ?? ""),
       title: String(issue.title ?? ""),
@@ -192,6 +216,7 @@ async function initializeSession(input: {
       status: String(issue.status ?? ""),
       priority: String(issue.priority ?? ""),
       comments,
+      attachments,
     };
 
     await onLog(
@@ -213,6 +238,14 @@ function buildTaskContextBlock(task: TaskContext): string {
 
   if (task.description.trim()) {
     lines.push(`### Description\n\n${task.description}\n`);
+  }
+
+  if (task.attachments.length > 0) {
+    lines.push(`### Attachments\n`);
+    for (const a of task.attachments) {
+      lines.push(`- **${a.originalFilename}** (${a.contentType}, ${Math.round(a.byteSize / 1024)}KB)`);
+      lines.push(`  Download: ${a.contentUrl}\n`);
+    }
   }
 
   if (task.comments.length > 0) {
