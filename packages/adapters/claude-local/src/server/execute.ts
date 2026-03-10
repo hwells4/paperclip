@@ -50,8 +50,11 @@ async function resolvePaperclipSkillsDir(): Promise<string | null> {
  *
  * Also writes `.claude/settings.json` with a Stop hook that posts a run
  * summary comment back to the triggering Paperclip issue.
+ *
+ * Returns { dir, settingsFile } where settingsFile is set only when the
+ * Stop hook was successfully injected.
  */
-async function buildSkillsDir(): Promise<string> {
+async function buildSkillsDir(): Promise<{ dir: string; settingsFile: string | null }> {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-"));
   const claudeDir = path.join(tmp, ".claude");
   const target = path.join(claudeDir, "skills");
@@ -70,6 +73,7 @@ async function buildSkillsDir(): Promise<string> {
   }
 
   // Inject Stop hook for automatic run-summary posting
+  let settingsFile: string | null = null;
   const hookExists = await fs.stat(RUN_SUMMARY_HOOK).then(() => true).catch(() => false);
   if (hookExists) {
     const settings = {
@@ -88,13 +92,11 @@ async function buildSkillsDir(): Promise<string> {
         ],
       },
     };
-    await fs.writeFile(
-      path.join(claudeDir, "settings.json"),
-      JSON.stringify(settings, null, 2),
-    );
+    settingsFile = path.join(claudeDir, "settings.json");
+    await fs.writeFile(settingsFile, JSON.stringify(settings, null, 2));
   }
 
-  return tmp;
+  return { dir: tmp, settingsFile };
 }
 
 interface ClaudeExecutionInput {
@@ -337,7 +339,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     extraArgs,
   } = runtimeConfig;
   const billingType = resolveClaudeBillingType(env);
-  const skillsDir = await buildSkillsDir();
+  const { dir: skillsDir, settingsFile: skillsSettingsFile } = await buildSkillsDir();
 
   // When instructionsFilePath is configured, create a combined temp file that
   // includes both the file content and the path directive, so we only need
@@ -386,6 +388,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       args.push("--append-system-prompt-file", effectiveInstructionsFilePath);
     }
     args.push("--add-dir", skillsDir);
+    if (skillsSettingsFile) {
+      args.push("--settings", skillsSettingsFile);
+    }
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;
   };
