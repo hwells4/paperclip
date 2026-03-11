@@ -21,8 +21,7 @@ const GAP_Y = 80;
 const PADDING = 60;
 const PROJECT_REGION_PAD_X = 24;
 const PROJECT_REGION_PAD_Y = 20;
-const PROJECT_REGION_LABEL_H = 18;
-const PROJECT_REGION_LANE_GAP = 20;
+const PROJECT_REGION_LABEL_H = 22;
 
 // ── Tree layout types ───────────────────────────────────────────────────
 
@@ -126,41 +125,34 @@ function collectEdges(nodes: LayoutNode[]): Array<{ parent: LayoutNode; child: L
   return edges;
 }
 
-function rangesOverlap(startA: number, endA: number, startB: number, endB: number): boolean {
-  return startA < endB && startB < endA;
-}
+/** Offset overlapping project region labels so they don't stack on top of each other. */
+function separateRegionLabels(regions: ProjectRegion[]): ProjectRegion[] {
+  // Sort left-to-right so we process in visual order
+  const sorted = [...regions].sort((a, b) => a.x - b.x);
+  const result: ProjectRegion[] = [];
 
-function assignProjectRegionLanes(
-  regions: Array<ProjectRegion & { baseY: number }>,
-): ProjectRegion[] {
-  const lanes: Array<Array<ProjectRegion & { baseY: number }>> = [];
-  const positioned: ProjectRegion[] = [];
+  for (const region of sorted) {
+    let labelY = region.y;
 
-  for (const region of [...regions].sort((a, b) => a.x - b.x || a.baseY - b.baseY)) {
-    let laneIndex = 0;
-
-    while (laneIndex < lanes.length) {
-      const lane = lanes[laneIndex]!;
-      const collides = lane.some((placed) =>
-        rangesOverlap(region.x, region.x + region.width, placed.x, placed.x + placed.width),
-      );
-      if (!collides) break;
-      laneIndex += 1;
+    // Check if our label row overlaps any already-placed region's label row
+    for (const placed of result) {
+      const horizOverlap =
+        region.x < placed.x + placed.width && placed.x < region.x + region.width;
+      if (horizOverlap && Math.abs(labelY - placed.y) < PROJECT_REGION_LABEL_H + 4) {
+        // Push this label above the conflicting one
+        labelY = placed.y - PROJECT_REGION_LABEL_H - 6;
+      }
     }
 
-    const laneOffset =
-      laneIndex * (PROJECT_REGION_LABEL_H + PROJECT_REGION_PAD_Y + PROJECT_REGION_LANE_GAP);
-    const positionedRegion: ProjectRegion & { baseY: number } = {
+    const dy = region.y - labelY;
+    result.push({
       ...region,
-      y: Math.max(PADDING / 2, region.baseY - laneOffset),
-    };
-
-    if (!lanes[laneIndex]) lanes[laneIndex] = [];
-    lanes[laneIndex]!.push(positionedRegion);
-    positioned.push(positionedRegion);
+      y: labelY,
+      height: region.height + dy,
+    });
   }
 
-  return positioned;
+  return result;
 }
 
 // ── Status dot colors (raw hex for SVG) ─────────────────────────────────
@@ -229,7 +221,7 @@ export function OrgChart() {
   const projectRegions = useMemo(() => {
     if (!projectsList || allNodes.length === 0) return [];
     const nodeMap = new Map(allNodes.map((n) => [n.id, n]));
-    const regions: Array<ProjectRegion & { baseY: number }> = [];
+    const regions: ProjectRegion[] = [];
 
     for (const project of projectsList) {
       if (project.archivedAt || !project.agentIds || project.agentIds.length === 0) continue;
@@ -252,14 +244,13 @@ export function OrgChart() {
       regions.push({
         project,
         x: minX - PROJECT_REGION_PAD_X,
-        baseY: minY - PROJECT_REGION_PAD_Y - PROJECT_REGION_LABEL_H,
         y: minY - PROJECT_REGION_PAD_Y - PROJECT_REGION_LABEL_H,
         width: maxX - minX + PROJECT_REGION_PAD_X * 2,
         height: maxY - minY + PROJECT_REGION_PAD_Y * 2 + PROJECT_REGION_LABEL_H,
       });
     }
 
-    return assignProjectRegionLanes(regions);
+    return separateRegionLabels(regions);
   }, [projectsList, allNodes]);
 
   const bounds = useMemo(() => {
@@ -476,13 +467,14 @@ export function OrgChart() {
               top: y,
               width,
               height,
-              backgroundColor: `${project.color ?? "#6366f1"}10`,
-              border: `1px solid ${project.color ?? "#6366f1"}25`,
+              backgroundColor: `${project.color ?? "#6366f1"}14`,
+              border: `1.5px dashed ${project.color ?? "#6366f1"}40`,
+              borderRadius: 12,
             }}
           >
             <span
-              className="absolute top-1.5 left-3 text-[10px] font-medium leading-none"
-              style={{ color: project.color ?? "#6366f1" }}
+              className="absolute top-2 left-3 text-[11px] font-semibold leading-none tracking-wide uppercase"
+              style={{ color: project.color ?? "#6366f1", opacity: 0.85 }}
             >
               {project.name}
             </span>
