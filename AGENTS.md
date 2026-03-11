@@ -140,3 +140,69 @@ A change is done when all are true:
 2. Typecheck, tests, and build pass
 3. Contracts are synced across db/shared/server/ui
 4. Docs updated when behavior or commands change
+
+## 11. Pull Request Rules
+
+**All PRs must target the `main` branch.** The CI pipeline only triggers on PRs to `main`. PRs targeting other branches will not receive checks, reviews, or auto-merge.
+
+When creating a PR:
+
+- Target `main` as the base branch
+- Write a clear title (under 70 characters) and description
+- One logical change per PR
+- Ensure typecheck, tests, and build pass locally before pushing
+
+Do not manually edit `pnpm-lock.yaml` — CI owns lockfile updates. The exception is the `chore/refresh-lockfile` branch.
+
+## 12. CI/CD Pipeline
+
+### What happens when you open a PR to `main`
+
+Three workflows run automatically:
+
+1. **pr-verify** — runs `pnpm -r typecheck`, `pnpm test:run`, and `pnpm build`. Must pass.
+2. **pr-policy** — enforces lockfile policy (blocks manual lockfile edits) and validates dependency resolution.
+3. **pr-review** — runs 7 specialized Claude Code review agents in parallel:
+   - Architecture (patterns, boundaries, dependency direction)
+   - Security (auth, injection, secrets, input validation)
+   - Performance (N+1 queries, missing indexes, re-renders, caching)
+   - Pattern Consistency (naming, file organization, imports, types)
+   - Code Simplicity (over-engineering, dead code, complexity)
+   - Data Integrity (migration safety, data loss, referential integrity)
+   - Contract Sync (db/shared/server/ui stay in sync)
+
+   Each reviewer posts findings as a PR comment categorized as Critical, Warning, or Suggestion.
+
+### Auto-merge decision
+
+After all 7 reviewers complete, a `merge-decision` job runs:
+
+- **Low risk + no Critical findings** → PR is auto-merged (`--merge --delete-branch`)
+- **High risk OR any Critical finding** → PR is blocked with a summary comment for human review
+
+High-risk files (require human review):
+- `packages/db/src/schema/` and `packages/db/drizzle/` (schema and migrations)
+- `server/src/auth/` and `server/src/middleware/` (auth and middleware)
+- `.env*`, `Dockerfile`, `docker-compose*` (infrastructure)
+
+### What happens after merge to `main`
+
+Two workflows trigger on push to `main`:
+
+1. **deploy** — SSHs into the VPS and runs the deploy script automatically
+2. **refresh-lockfile** — regenerates `pnpm-lock.yaml` and opens a PR if it changed
+
+### Summary: PR lifecycle
+
+```
+push branch → open PR to main → pr-verify + pr-policy + pr-review run
+  → all pass + low risk + no criticals → auto-merge → deploy to VPS
+  → high risk or criticals → blocked, human reviews
+```
+
+## 13. Deployment
+
+- Production deploys happen automatically when code is merged to `main`
+- The deploy workflow SSHs to the VPS and runs `/home/ubuntu/deploy/paperclip-deploy.sh`
+- Rollback is available via the `rollback.yml` workflow (manual dispatch)
+- Do not push directly to `main` — always go through a PR so the review pipeline runs
