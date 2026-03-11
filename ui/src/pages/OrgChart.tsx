@@ -19,6 +19,10 @@ const CARD_H = 100;
 const GAP_X = 32;
 const GAP_Y = 80;
 const PADDING = 60;
+const PROJECT_REGION_PAD_X = 24;
+const PROJECT_REGION_PAD_Y = 20;
+const PROJECT_REGION_LABEL_H = 18;
+const PROJECT_REGION_LANE_GAP = 20;
 
 // ── Tree layout types ───────────────────────────────────────────────────
 
@@ -30,6 +34,14 @@ interface LayoutNode {
   x: number;
   y: number;
   children: LayoutNode[];
+}
+
+interface ProjectRegion {
+  project: Project;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 // ── Layout algorithm ────────────────────────────────────────────────────
@@ -114,6 +126,43 @@ function collectEdges(nodes: LayoutNode[]): Array<{ parent: LayoutNode; child: L
   return edges;
 }
 
+function rangesOverlap(startA: number, endA: number, startB: number, endB: number): boolean {
+  return startA < endB && startB < endA;
+}
+
+function assignProjectRegionLanes(
+  regions: Array<ProjectRegion & { baseY: number }>,
+): ProjectRegion[] {
+  const lanes: Array<Array<ProjectRegion & { baseY: number }>> = [];
+  const positioned: ProjectRegion[] = [];
+
+  for (const region of [...regions].sort((a, b) => a.x - b.x || a.baseY - b.baseY)) {
+    let laneIndex = 0;
+
+    while (laneIndex < lanes.length) {
+      const lane = lanes[laneIndex]!;
+      const collides = lane.some((placed) =>
+        rangesOverlap(region.x, region.x + region.width, placed.x, placed.x + placed.width),
+      );
+      if (!collides) break;
+      laneIndex += 1;
+    }
+
+    const laneOffset =
+      laneIndex * (PROJECT_REGION_LABEL_H + PROJECT_REGION_PAD_Y + PROJECT_REGION_LANE_GAP);
+    const positionedRegion: ProjectRegion & { baseY: number } = {
+      ...region,
+      y: Math.max(PADDING / 2, region.baseY - laneOffset),
+    };
+
+    if (!lanes[laneIndex]) lanes[laneIndex] = [];
+    lanes[laneIndex]!.push(positionedRegion);
+    positioned.push(positionedRegion);
+  }
+
+  return positioned;
+}
+
 // ── Status dot colors (raw hex for SVG) ─────────────────────────────────
 
 const adapterLabels: Record<string, string> = {
@@ -177,27 +226,10 @@ export function OrgChart() {
   const edges = useMemo(() => collectEdges(layout), [layout]);
 
   // Compute SVG bounds
-  const bounds = useMemo(() => {
-    if (allNodes.length === 0) return { width: 800, height: 600 };
-    let maxX = 0, maxY = 0;
-    for (const n of allNodes) {
-      maxX = Math.max(maxX, n.x + CARD_W);
-      maxY = Math.max(maxY, n.y + CARD_H);
-    }
-    return { width: maxX + PADDING, height: maxY + PADDING };
-  }, [allNodes]);
-
-  // Compute project group regions
   const projectRegions = useMemo(() => {
     if (!projectsList || allNodes.length === 0) return [];
     const nodeMap = new Map(allNodes.map((n) => [n.id, n]));
-    const regions: Array<{
-      project: Project;
-      x: number;
-      y: number;
-      width: number;
-      height: number;
-    }> = [];
+    const regions: Array<ProjectRegion & { baseY: number }> = [];
 
     for (const project of projectsList) {
       if (project.archivedAt || !project.agentIds || project.agentIds.length === 0) continue;
@@ -206,24 +238,43 @@ export function OrgChart() {
         .filter((n): n is LayoutNode => Boolean(n));
       if (memberNodes.length === 0) continue;
 
-      const pad = 16;
-      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
       for (const n of memberNodes) {
         minX = Math.min(minX, n.x);
         minY = Math.min(minY, n.y);
         maxX = Math.max(maxX, n.x + CARD_W);
         maxY = Math.max(maxY, n.y + CARD_H);
       }
+
       regions.push({
         project,
-        x: minX - pad,
-        y: minY - pad - 16, // extra space for label
-        width: maxX - minX + pad * 2,
-        height: maxY - minY + pad * 2 + 16,
+        x: minX - PROJECT_REGION_PAD_X,
+        baseY: minY - PROJECT_REGION_PAD_Y - PROJECT_REGION_LABEL_H,
+        y: minY - PROJECT_REGION_PAD_Y - PROJECT_REGION_LABEL_H,
+        width: maxX - minX + PROJECT_REGION_PAD_X * 2,
+        height: maxY - minY + PROJECT_REGION_PAD_Y * 2 + PROJECT_REGION_LABEL_H,
       });
     }
-    return regions;
+
+    return assignProjectRegionLanes(regions);
   }, [projectsList, allNodes]);
+
+  const bounds = useMemo(() => {
+    if (allNodes.length === 0 && projectRegions.length === 0) return { width: 800, height: 600 };
+    let maxX = 0, maxY = 0;
+    for (const n of allNodes) {
+      maxX = Math.max(maxX, n.x + CARD_W);
+      maxY = Math.max(maxY, n.y + CARD_H);
+    }
+    for (const region of projectRegions) {
+      maxX = Math.max(maxX, region.x + region.width);
+      maxY = Math.max(maxY, region.y + region.height);
+    }
+    return { width: maxX + PADDING, height: maxY + PADDING };
+  }, [allNodes, projectRegions]);
 
   // Pan & zoom state
   const containerRef = useRef<HTMLDivElement>(null);
