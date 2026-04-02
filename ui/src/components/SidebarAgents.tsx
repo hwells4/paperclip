@@ -7,9 +7,11 @@ import { useDialog } from "../context/DialogContext";
 import { useSidebar } from "../context/SidebarContext";
 import { agentsApi } from "../api/agents";
 import { projectsApi } from "../api/projects";
+import { authApi } from "../api/auth";
 import { heartbeatsApi } from "../api/heartbeats";
 import { queryKeys } from "../lib/queryKeys";
 import { cn, agentRouteRef, agentUrl } from "../lib/utils";
+import { useAgentOrder } from "../hooks/useAgentOrder";
 import { AgentIcon } from "./AgentIconPicker";
 import {
   Collapsible,
@@ -43,6 +45,7 @@ function AgentNavItem({
   agent,
   runCount,
   activeAgentId,
+  activeTab,
   isMobile,
   setSidebarOpen,
   indent,
@@ -50,13 +53,14 @@ function AgentNavItem({
   agent: Agent;
   runCount: number;
   activeAgentId: string | null;
+  activeTab: string | null;
   isMobile: boolean;
   setSidebarOpen: (open: boolean) => void;
   indent?: boolean;
 }) {
   return (
     <NavLink
-      to={agentUrl(agent)}
+      to={activeTab ? `${agentUrl(agent)}/${activeTab}` : agentUrl(agent)}
       onClick={() => {
         if (isMobile) setSidebarOpen(false);
       }}
@@ -73,7 +77,7 @@ function AgentNavItem({
       {runCount > 0 && (
         <span className="ml-auto flex items-center gap-1.5 shrink-0">
           <span className="relative flex h-2 w-2">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+            <span className="animate-pulse absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
             <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
           </span>
           <span className="text-[11px] font-medium text-blue-600 dark:text-blue-400">
@@ -102,6 +106,10 @@ export function SidebarAgents() {
     queryFn: () => agentsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+  const { data: session } = useQuery({
+    queryKey: queryKeys.auth.session,
+    queryFn: () => authApi.getSession(),
+  });
 
   const { data: projects } = useQuery({
     queryKey: queryKeys.projects.list(selectedCompanyId!),
@@ -128,8 +136,14 @@ export function SidebarAgents() {
     const filtered = (agents ?? []).filter(
       (a: Agent) => a.status !== "terminated"
     );
-    return sortByHierarchy(filtered);
+    return filtered;
   }, [agents]);
+  const currentUserId = session?.user?.id ?? session?.session?.userId ?? null;
+  const { orderedAgents } = useAgentOrder({
+    agents: visibleAgents,
+    companyId: selectedCompanyId,
+    userId: currentUserId,
+  });
 
   const { pinnedAgents, projectGroups, ungroupedAgents } = useMemo(() => {
     const pinned = visibleAgents.filter((a) => a.role === "ceo");
@@ -154,8 +168,10 @@ export function SidebarAgents() {
 
   const hasGroups = projectGroups.length > 0;
 
-  const agentMatch = location.pathname.match(/^\/(?:[^/]+\/)?agents\/([^/]+)/);
+  const agentMatch = location.pathname.match(/^\/(?:[^/]+\/)?agents\/([^/]+)(?:\/([^/]+))?/);
   const activeAgentId = agentMatch?.[1] ?? null;
+  const activeTab = agentMatch?.[2] ?? null;
+
 
   // Track open state for each project group
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
@@ -199,6 +215,7 @@ export function SidebarAgents() {
               agent={agent}
               runCount={liveCountByAgent.get(agent.id) ?? 0}
               activeAgentId={activeAgentId}
+              activeTab={activeTab}
               isMobile={isMobile}
               setSidebarOpen={setSidebarOpen}
             />
@@ -238,6 +255,7 @@ export function SidebarAgents() {
                       agent={agent}
                       runCount={liveCountByAgent.get(agent.id) ?? 0}
                       activeAgentId={activeAgentId}
+                      activeTab={activeTab}
                       isMobile={isMobile}
                       setSidebarOpen={setSidebarOpen}
                       indent
@@ -255,6 +273,7 @@ export function SidebarAgents() {
               agent={agent}
               runCount={liveCountByAgent.get(agent.id) ?? 0}
               activeAgentId={activeAgentId}
+              activeTab={activeTab}
               isMobile={isMobile}
               setSidebarOpen={setSidebarOpen}
               indent={hasGroups}

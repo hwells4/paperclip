@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useMemo, useCallback } from "react";
-import { useNavigate } from "@/lib/router";
+import { Link, useNavigate } from "@/lib/router";
 import { useQuery } from "@tanstack/react-query";
 import { agentsApi, type OrgNode } from "../api/agents";
 import { projectsApi } from "../api/projects";
@@ -7,10 +7,11 @@ import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
 import { agentUrl } from "../lib/utils";
+import { Button } from "@/components/ui/button";
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { AgentIcon } from "../components/AgentIconPicker";
-import { Network } from "lucide-react";
+import { Download, Network, Upload } from "lucide-react";
 import { AGENT_ROLE_LABELS, type Agent, type Project } from "@paperclipai/shared";
 
 // Layout constants
@@ -160,8 +161,10 @@ function separateRegionLabels(regions: ProjectRegion[]): ProjectRegion[] {
 const adapterLabels: Record<string, string> = {
   claude_local: "Claude",
   codex_local: "Codex",
+  gemini_local: "Gemini",
   opencode_local: "OpenCode",
   cursor: "Cursor",
+  hermes_local: "Hermes",
   openclaw_gateway: "OpenClaw Gateway",
   process: "Process",
   http: "HTTP",
@@ -353,9 +356,24 @@ export function OrgChart() {
   }
 
   return (
+    <div className="flex flex-col h-full">
+    <div className="mb-2 flex items-center justify-start gap-2 shrink-0">
+      <Link to="/company/import">
+        <Button variant="outline" size="sm">
+          <Upload className="mr-1.5 h-3.5 w-3.5" />
+          Import company
+        </Button>
+      </Link>
+      <Link to="/company/export">
+        <Button variant="outline" size="sm">
+          <Download className="mr-1.5 h-3.5 w-3.5" />
+          Export company
+        </Button>
+      </Link>
+    </div>
     <div
       ref={containerRef}
-      className="w-full h-[calc(100vh-4rem)] overflow-hidden relative bg-muted/20 border border-border rounded-lg"
+      className="w-full flex-1 min-h-0 overflow-hidden relative bg-muted/20 border border-border rounded-lg"
       style={{ cursor: dragging ? "grabbing" : "grab" }}
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
@@ -529,10 +547,11 @@ export function OrgChart() {
         })}
       </div>
     </div>
+    </div>
   );
 }
 
-const roleLabels = AGENT_ROLE_LABELS as Record<string, string>;
+const roleLabels: Record<string, string> = AGENT_ROLE_LABELS;
 
 function roleLabel(role: string): string {
   return roleLabels[role] ?? role;
