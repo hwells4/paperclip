@@ -1,5 +1,4 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -20,6 +19,9 @@ import {
   ensurePathInEnv,
   resolveCommandForLogs,
   renderTemplate,
+  renderPaperclipWakePrompt,
+  stringifyPaperclipWakePayload,
+  DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
@@ -30,235 +32,10 @@ import {
   isClaudeUnknownSessionError,
 } from "./parse.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
+import { isBedrockModelId } from "./models.js";
+import { prepareClaudePromptBundle } from "./prompt-cache.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
-const RUN_SUMMARY_HOOK = path.resolve(__moduleDir, "../../hooks/run-summary.py");
-
-/**
- * Create a tmpdir with `.claude/skills/` containing symlinks to skills from
- * the repo's `skills/` directory, so `--add-dir` makes Claude Code discover
- * them as proper registered skills.
- *
- * Also writes `.claude/settings.json` with a Stop hook that posts a run
- * summary comment back to the triggering Paperclip issue.
- *
- * Returns { dir, settingsFile } where settingsFile is set only when the
- * Stop hook was successfully injected.
- */
-async function buildSkillsDir(config: Record<string, unknown>): Promise<{ dir: string; settingsFile: string | null }> {
-  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-"));
-  const claudeDir = path.join(tmp, ".claude");
-  const target = path.join(claudeDir, "skills");
-  await fs.mkdir(target, { recursive: true });
-  const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
-  const desiredNames = new Set(
-    resolveClaudeDesiredSkillNames(
-      config,
-      availableEntries,
-    ),
-  );
-  for (const entry of availableEntries) {
-    if (!desiredNames.has(entry.key)) continue;
-    await fs.symlink(
-      entry.source,
-      path.join(target, entry.runtimeName),
-    );
-  }
-
-  // Inject Stop hook for automatic run-summary posting
-  let settingsFile: string | null = null;
-  const hookExists = await fs.stat(RUN_SUMMARY_HOOK).then(() => true).catch(() => false);
-  if (hookExists) {
-    const settings = {
-      hooks: {
-        Stop: [
-          {
-            matcher: "",
-            hooks: [
-              {
-                type: "command",
-                command: `python3 ${RUN_SUMMARY_HOOK}`,
-                timeout: 90,
-              },
-            ],
-          },
-        ],
-      },
-    };
-    settingsFile = path.join(claudeDir, "settings.json");
-    await fs.writeFile(settingsFile, JSON.stringify(settings, null, 2));
-  }
-
-  return { dir: tmp, settingsFile };
-}
-
-// ---------------------------------------------------------------------------
-// Session initialization: fetch task context and auto-checkout before the
-// agent starts so it can skip the Paperclip heartbeat procedure and go
-// straight to doing work.
-// ---------------------------------------------------------------------------
-
-interface TaskAttachment {
-  id: string;
-  originalFilename: string;
-  contentType: string;
-  byteSize: number;
-  contentUrl: string;
-}
-
-interface TaskContext {
-  identifier: string;
-  title: string;
-  description: string;
-  status: string;
-  priority: string;
-  comments: Array<{ author: string; body: string; createdAt: string }>;
-  attachments: TaskAttachment[];
-}
-
-async function paperclipFetch(
-  apiUrl: string,
-  path: string,
-  authToken: string,
-  opts?: { method?: string; body?: Record<string, unknown>; runId?: string },
-): Promise<unknown> {
-  const url = `${apiUrl}${path}`;
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${authToken}`,
-    "Content-Type": "application/json",
-  };
-  if (opts?.runId) {
-    headers["X-Paperclip-Run-Id"] = opts.runId;
-  }
-  const res = await fetch(url, {
-    method: opts?.method ?? "GET",
-    headers,
-    ...(opts?.body ? { body: JSON.stringify(opts.body) } : {}),
-  });
-  if (!res.ok) return null;
-  return res.json();
-}
-
-async function initializeSession(input: {
-  apiUrl: string;
-  authToken: string;
-  agentId: string;
-  taskId: string;
-  runId: string;
-  onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
-}): Promise<TaskContext | null> {
-  const { apiUrl, authToken, agentId, taskId, runId, onLog } = input;
-
-  try {
-    // 1. Checkout the issue (marks it in_progress)
-    await paperclipFetch(apiUrl, `/api/issues/${taskId}/checkout`, authToken, {
-      method: "POST",
-      body: { agentId, expectedStatuses: ["todo", "backlog", "in_progress"] },
-      runId,
-    });
-    await onLog("stderr", `[paperclip] Checked out issue ${taskId}\n`);
-
-    // 2. Fetch issue details
-    const issue = (await paperclipFetch(apiUrl, `/api/issues/${taskId}`, authToken)) as Record<
-      string,
-      unknown
-    > | null;
-    if (!issue) {
-      await onLog("stderr", `[paperclip] Failed to fetch issue ${taskId}\n`);
-      return null;
-    }
-
-    // 3. Fetch comments
-    const commentsRaw = (await paperclipFetch(
-      apiUrl,
-      `/api/issues/${taskId}/comments`,
-      authToken,
-    )) as Array<Record<string, unknown>> | null;
-
-    const comments = (commentsRaw ?? []).map((c) => ({
-      author: String(
-        c.authorAgent
-          ? (c.authorAgent as Record<string, unknown>).name ?? "agent"
-          : c.authorUser
-            ? (c.authorUser as Record<string, unknown>).name ?? "user"
-            : "unknown",
-      ),
-      body: String(c.body ?? ""),
-      createdAt: String(c.createdAt ?? ""),
-    }));
-
-    // 4. Fetch attachments
-    const attachmentsRaw = (await paperclipFetch(
-      apiUrl,
-      `/api/issues/${taskId}/attachments`,
-      authToken,
-    )) as Array<Record<string, unknown>> | null;
-
-    const attachments: TaskAttachment[] = (attachmentsRaw ?? []).map((a) => ({
-      id: String(a.id ?? ""),
-      originalFilename: String(a.originalFilename ?? ""),
-      contentType: String(a.contentType ?? ""),
-      byteSize: Number(a.byteSize ?? 0),
-      contentUrl: `${apiUrl}${String(a.contentPath ?? `/api/attachments/${a.id}/content`)}`,
-    }));
-
-    const taskContext: TaskContext = {
-      identifier: String(issue.identifier ?? ""),
-      title: String(issue.title ?? ""),
-      description: String(issue.description ?? ""),
-      status: String(issue.status ?? ""),
-      priority: String(issue.priority ?? ""),
-      comments,
-      attachments,
-    };
-
-    await onLog(
-      "stderr",
-      `[paperclip] Injecting context for ${taskContext.identifier}: "${taskContext.title}"\n`,
-    );
-    return taskContext;
-  } catch (err) {
-    await onLog("stderr", `[paperclip] Session init failed: ${err}\n`);
-    return null;
-  }
-}
-
-function buildTaskContextBlock(task: TaskContext): string {
-  const lines: string[] = [
-    `\n\n---\n## Your Task: ${task.identifier} — ${task.title}\n`,
-    `**Status**: ${task.status} | **Priority**: ${task.priority}\n`,
-  ];
-
-  if (task.description.trim()) {
-    lines.push(`### Description\n\n${task.description}\n`);
-  }
-
-  if (task.attachments.length > 0) {
-    lines.push(`### Attachments\n`);
-    for (const a of task.attachments) {
-      lines.push(`- **${a.originalFilename}** (${a.contentType}, ${Math.round(a.byteSize / 1024)}KB)`);
-      lines.push(`  Download: ${a.contentUrl}\n`);
-    }
-  }
-
-  if (task.comments.length > 0) {
-    lines.push(`### Comments\n`);
-    for (const c of task.comments) {
-      lines.push(`**${c.author}** (${c.createdAt}):\n${c.body}\n`);
-    }
-  }
-
-  lines.push(
-    `---`,
-    `\nThis task has been checked out for you. Do the work described above.`,
-    `When you're done, just finish your session — a stop hook will automatically post a summary and mark the task complete.`,
-    `You do NOT need to call the Paperclip API yourself.\n`,
-  );
-
-  return lines.join("\n");
-}
-
-// ---------------------------------------------------------------------------
 
 interface ClaudeExecutionInput {
   runId: string;
@@ -301,8 +78,16 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
   return typeof raw === "string" && raw.trim().length > 0;
 }
 
-function resolveClaudeBillingType(env: Record<string, string>): "api" | "subscription" {
-  // Claude uses API-key auth when ANTHROPIC_API_KEY is present; otherwise rely on local login/session auth.
+function isBedrockAuth(env: Record<string, string>): boolean {
+  return (
+    env.CLAUDE_CODE_USE_BEDROCK === "1" ||
+    env.CLAUDE_CODE_USE_BEDROCK === "true" ||
+    hasNonEmptyEnvValue(env, "ANTHROPIC_BEDROCK_BASE_URL")
+  );
+}
+
+function resolveClaudeBillingType(env: Record<string, string>): "api" | "subscription" | "metered_api" {
+  if (isBedrockAuth(env)) return "metered_api";
   return hasNonEmptyEnvValue(env, "ANTHROPIC_API_KEY") ? "api" : "subscription";
 }
 
@@ -371,6 +156,7 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
+  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
 
   if (wakeTaskId) {
     env.PAPERCLIP_TASK_ID = wakeTaskId;
@@ -389,6 +175,9 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   }
   if (linkedIssueIds.length > 0) {
     env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
+  }
+  if (wakePayloadJson) {
+    env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   }
   if (effectiveWorkspaceCwd) {
     env.PAPERCLIP_WORKSPACE_CWD = effectiveWorkspaceCwd;
@@ -512,21 +301,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const promptTemplate = asString(
     config.promptTemplate,
-    "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.",
+    DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const model = asString(config.model, "");
   const effort = asString(config.effort, "");
   const chrome = asBoolean(config.chrome, false);
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
-  const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, false);
+  const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   const instructionsFileDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
-  const commandNotes = instructionsFilePath
-    ? [
-        `Injected agent instructions via --append-system-prompt-file ${instructionsFilePath} (with path directive appended)`,
-      ]
-    : [];
-
   const runtimeConfig = await buildClaudeRuntimeConfig({
     runId,
     agent,
@@ -547,46 +330,72 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     graceSec,
     extraArgs,
   } = runtimeConfig;
+  const terminalResultCleanupGraceMs = Math.max(
+    0,
+    asNumber(config.terminalResultCleanupGraceMs, 5_000),
+  );
   const effectiveEnv = Object.fromEntries(
     Object.entries({ ...process.env, ...env }).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
   const billingType = resolveClaudeBillingType(effectiveEnv);
-  const { dir: skillsDir, settingsFile: skillsSettingsFile } = await buildSkillsDir(config);
-
-  // When instructionsFilePath is configured, create a combined temp file that
-  // includes both the file content and the path directive, so we only need
-  // --append-system-prompt-file (Claude CLI forbids using both flags together).
-  let effectiveInstructionsFilePath: string | undefined = instructionsFilePath;
+  const claudeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
+  const desiredSkillNames = new Set(resolveClaudeDesiredSkillNames(config, claudeSkillEntries));
+  // When instructionsFilePath is configured, build a stable content-addressed
+  // file that includes both the file content and the path directive, so we only
+  // need --append-system-prompt-file (Claude CLI forbids using both flags together).
+  let combinedInstructionsContents: string | null = null;
   if (instructionsFilePath) {
     try {
       const instructionsContent = await fs.readFile(instructionsFilePath, "utf-8");
-      const pathDirective = `\nThe above agent instructions were loaded from ${instructionsFilePath}. Resolve any relative file references from ${instructionsFileDir}.`;
-      const combinedPath = path.join(skillsDir, "agent-instructions.md");
-      await fs.writeFile(combinedPath, instructionsContent + pathDirective, "utf-8");
-      effectiveInstructionsFilePath = combinedPath;
+      const pathDirective =
+        `\nThe above agent instructions were loaded from ${instructionsFilePath}. ` +
+        `Resolve any relative file references from ${instructionsFileDir}. ` +
+        `This base directory is authoritative for sibling instruction files such as ` +
+        `./HEARTBEAT.md, ./SOUL.md, and ./TOOLS.md; do not resolve those from the parent agent directory.`;
+      combinedInstructionsContents = instructionsContent + pathDirective;
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       await onLog(
         "stderr",
         `[paperclip] Warning: could not read agent instructions file "${instructionsFilePath}": ${reason}\n`,
       );
-      effectiveInstructionsFilePath = undefined;
     }
   }
+  const promptBundle = await prepareClaudePromptBundle({
+    companyId: agent.companyId,
+    skills: claudeSkillEntries.filter((entry) => desiredSkillNames.has(entry.key)),
+    instructionsContents: combinedInstructionsContents,
+    onLog,
+  });
+  const effectiveInstructionsFilePath = promptBundle.instructionsFilePath ?? undefined;
 
   const runtimeSessionParams = parseObject(runtime.sessionParams);
   const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
   const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
+  const runtimePromptBundleKey = asString(runtimeSessionParams.promptBundleKey, "");
+  const hasMatchingPromptBundle =
+    runtimePromptBundleKey.length === 0 || runtimePromptBundleKey === promptBundle.bundleKey;
   const canResumeSession =
     runtimeSessionId.length > 0 &&
+    hasMatchingPromptBundle &&
     (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(cwd));
   const sessionId = canResumeSession ? runtimeSessionId : null;
-  if (runtimeSessionId && !canResumeSession) {
+  if (
+    runtimeSessionId &&
+    runtimeSessionCwd.length > 0 &&
+    path.resolve(runtimeSessionCwd) !== path.resolve(cwd)
+  ) {
     await onLog(
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${cwd}".\n`,
+    );
+  }
+  if (runtimeSessionId && runtimePromptBundleKey.length > 0 && runtimePromptBundleKey !== promptBundle.bundleKey) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude session "${runtimeSessionId}" was saved for prompt bundle "${runtimePromptBundleKey}" and will not be resumed with "${promptBundle.bundleKey}".\n`,
     );
   }
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
@@ -599,58 +408,51 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     run: { id: runId, source: "on_demand" },
     context,
   };
-  const renderedPrompt = renderTemplate(promptTemplate, templateData);
   const renderedBootstrapPrompt =
     !sessionId && bootstrapPromptTemplate.trim().length > 0
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(sessionId) });
+  const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
+  const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
-  let prompt = joinPromptSections([
+  const prompt = joinPromptSections([
     renderedBootstrapPrompt,
+    wakePrompt,
     sessionHandoffNote,
     renderedPrompt,
   ]);
   const promptMetrics = {
     promptChars: prompt.length,
     bootstrapPromptChars: renderedBootstrapPrompt.length,
+    wakePromptChars: wakePrompt.length,
     sessionHandoffChars: sessionHandoffNote.length,
     heartbeatPromptChars: renderedPrompt.length,
   };
 
-  // Session initialization: if woken for a specific task, fetch its context
-  // and inject it into the prompt so the agent can skip the heartbeat procedure.
-  const taskId = env.PAPERCLIP_TASK_ID;
-  const apiUrl = env.PAPERCLIP_API_URL;
-  const taskAuthToken = env.PAPERCLIP_API_KEY;
-  if (taskId && apiUrl && taskAuthToken) {
-    const taskContext = await initializeSession({
-      apiUrl,
-      authToken: taskAuthToken,
-      agentId: agent.id,
-      taskId,
-      runId,
-      onLog,
-    });
-    if (taskContext) {
-      prompt += buildTaskContextBlock(taskContext);
-    }
-  }
-
-  const buildClaudeArgs = (resumeSessionId: string | null) => {
+  const buildClaudeArgs = (
+    resumeSessionId: string | null,
+    attemptInstructionsFilePath: string | undefined,
+  ) => {
     const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     if (dangerouslySkipPermissions) args.push("--dangerously-skip-permissions");
     if (chrome) args.push("--chrome");
-    if (model) args.push("--model", model);
+    // For Bedrock: only pass --model when the ID is a Bedrock-native identifier
+    // (e.g. "us.anthropic.*" or ARN). Anthropic-style IDs like "claude-opus-4-6" are invalid
+    // on Bedrock, so skip them and let the CLI use its own configured model.
+    if (model && (!isBedrockAuth(effectiveEnv) || isBedrockModelId(model))) {
+      args.push("--model", model);
+    }
     if (effort) args.push("--effort", effort);
     if (maxTurns > 0) args.push("--max-turns", String(maxTurns));
-    if (effectiveInstructionsFilePath) {
-      args.push("--append-system-prompt-file", effectiveInstructionsFilePath);
+    // On resumed sessions the instructions are already in the session cache;
+    // re-injecting them via --append-system-prompt-file wastes 5-10K tokens
+    // per heartbeat and the Claude CLI may reject the combination outright.
+    if (attemptInstructionsFilePath && !resumeSessionId) {
+      args.push("--append-system-prompt-file", attemptInstructionsFilePath);
     }
-    args.push("--add-dir", skillsDir);
-    if (skillsSettingsFile) {
-      args.push("--settings", skillsSettingsFile);
-    }
+    args.push("--add-dir", promptBundle.addDir);
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;
   };
@@ -672,7 +474,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   };
 
   const runAttempt = async (resumeSessionId: string | null) => {
-    const args = buildClaudeArgs(resumeSessionId);
+    const attemptInstructionsFilePath = resumeSessionId ? undefined : effectiveInstructionsFilePath;
+    const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath);
+    const commandNotes: string[] = [];
+    if (!resumeSessionId) {
+      commandNotes.push(`Using stable Claude prompt bundle ${promptBundle.bundleKey}.`);
+    }
+    if (attemptInstructionsFilePath && !resumeSessionId) {
+      commandNotes.push(
+        `Injected agent instructions via --append-system-prompt-file ${instructionsFilePath} (with path directive appended)`,
+      );
+    }
     if (onMeta) {
       await onMeta({
         adapterType: "claude_local",
@@ -695,6 +507,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       graceSec,
       onSpawn,
       onLog,
+      terminalResultCleanup: {
+        graceMs: terminalResultCleanupGraceMs,
+        hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
+      },
     });
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
@@ -769,6 +585,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? ({
         sessionId: resolvedSessionId,
         cwd,
+        promptBundleKey: promptBundle.bundleKey,
         ...(workspaceId ? { workspaceId } : {}),
         ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
         ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
@@ -791,7 +608,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
       provider: "anthropic",
-      biller: "anthropic",
+      biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
       model: parsedStream.model || asString(parsed.model, model),
       billingType,
       costUsd: parsedStream.costUsd ?? asNumber(parsed.total_cost_usd, 0),
@@ -801,25 +618,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
-  try {
-    const initial = await runAttempt(sessionId ?? null);
-    if (
-      sessionId &&
-      !initial.proc.timedOut &&
-      (initial.proc.exitCode ?? 0) !== 0 &&
-      initial.parsed &&
-      isClaudeUnknownSessionError(initial.parsed)
-    ) {
-      await onLog(
-        "stdout",
-        `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
-      );
-      const retry = await runAttempt(null);
-      return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
-    }
-
-    return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
-  } finally {
-    fs.rm(skillsDir, { recursive: true, force: true }).catch(() => {});
+  const initial = await runAttempt(sessionId ?? null);
+  if (
+    sessionId &&
+    !initial.proc.timedOut &&
+    (initial.proc.exitCode ?? 0) !== 0 &&
+    initial.parsed &&
+    isClaudeUnknownSessionError(initial.parsed)
+  ) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+    );
+    const retry = await runAttempt(null);
+    return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
   }
+
+  return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
 }

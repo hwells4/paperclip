@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { projects, projectGoals, goals, projectWorkspaces, projectAgents, workspaceRuntimeServices } from "@paperclipai/db";
+import { projects, projectGoals, goals, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
   PROJECT_COLORS,
   deriveProjectUrlKey,
@@ -14,7 +14,7 @@ import {
   type ProjectWorkspace,
   type WorkspaceRuntimeService,
 } from "@paperclipai/shared";
-import { listWorkspaceRuntimeServicesForProjectWorkspaces } from "./workspace-runtime.js";
+import { listCurrentRuntimeServicesForProjectWorkspaces } from "./workspace-runtime-read-model.js";
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { mergeProjectWorkspaceRuntimeConfig, readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
@@ -46,7 +46,6 @@ interface ProjectWithGoals extends Omit<ProjectRow, "executionWorkspacePolicy"> 
   urlKey: string;
   goalIds: string[];
   goals: ProjectGoalRef[];
-  agentIds: string[];
   executionWorkspacePolicy: ProjectExecutionWorkspacePolicy | null;
   codebase: ProjectCodebase;
   workspaces: ProjectWorkspace[];
@@ -96,17 +95,8 @@ async function attachGoals(db: Db, rows: ProjectRow[]): Promise<ProjectWithGoals
       urlKey: deriveProjectUrlKey(r.name, r.id),
       goalIds: g.map((x) => x.id),
       goals: g,
-      agentIds: [] as string[],
       executionWorkspacePolicy: parseProjectExecutionWorkspacePolicy(r.executionWorkspacePolicy),
-      codebase: deriveProjectCodebase({
-        companyId: r.companyId,
-        projectId: r.id,
-        primaryWorkspace: null,
-        fallbackWorkspaces: [],
-      }),
-      workspaces: [] as ProjectWorkspace[],
-      primaryWorkspace: null,
-    } satisfies ProjectWithGoals;
+    } as ProjectWithGoals;
   });
 }
 
@@ -233,7 +223,7 @@ async function attachWorkspaces(db: Db, rows: ProjectWithGoals[]): Promise<Proje
     .from(projectWorkspaces)
     .where(inArray(projectWorkspaces.projectId, projectIds))
     .orderBy(desc(projectWorkspaces.isPrimary), asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id));
-  const runtimeServicesByWorkspaceId = await listWorkspaceRuntimeServicesForProjectWorkspaces(
+  const runtimeServicesByWorkspaceId = await listCurrentRuntimeServicesForProjectWorkspaces(
     db,
     rows[0]!.companyId,
     workspaceRows.map((workspace) => workspace.id),
@@ -276,35 +266,6 @@ async function attachWorkspaces(db: Db, rows: ProjectWithGoals[]): Promise<Proje
       primaryWorkspace,
     };
   });
-}
-
-/** Batch-load agent IDs for a set of projects. */
-async function attachAgentIds(db: Db, rows: ProjectWithGoals[]): Promise<ProjectWithGoals[]> {
-  if (rows.length === 0) return [];
-
-  const projectIds = rows.map((r) => r.id);
-  const links = await db
-    .select({
-      projectId: projectAgents.projectId,
-      agentId: projectAgents.agentId,
-    })
-    .from(projectAgents)
-    .where(inArray(projectAgents.projectId, projectIds));
-
-  const map = new Map<string, string[]>();
-  for (const link of links) {
-    let arr = map.get(link.projectId);
-    if (!arr) {
-      arr = [];
-      map.set(link.projectId, arr);
-    }
-    arr.push(link.agentId);
-  }
-
-  return rows.map((r) => ({
-    ...r,
-    agentIds: map.get(r.id) ?? [],
-  }));
 }
 
 /** Sync the project_goals join table for a single project. */
@@ -441,8 +402,7 @@ export function projectService(db: Db) {
     list: async (companyId: string): Promise<ProjectWithGoals[]> => {
       const rows = await db.select().from(projects).where(eq(projects.companyId, companyId));
       const withGoals = await attachGoals(db, rows);
-      const withWorkspaces = await attachWorkspaces(db, withGoals);
-      return attachAgentIds(db, withWorkspaces);
+      return attachWorkspaces(db, withGoals);
     },
 
     listByIds: async (companyId: string, ids: string[]): Promise<ProjectWithGoals[]> => {
@@ -454,8 +414,7 @@ export function projectService(db: Db) {
         .where(and(eq(projects.companyId, companyId), inArray(projects.id, dedupedIds)));
       const withGoals = await attachGoals(db, rows);
       const withWorkspaces = await attachWorkspaces(db, withGoals);
-      const withAgents = await attachAgentIds(db, withWorkspaces);
-      const byId = new Map(withAgents.map((project) => [project.id, project]));
+      const byId = new Map(withWorkspaces.map((project) => [project.id, project]));
       return dedupedIds.map((id) => byId.get(id)).filter((project): project is ProjectWithGoals => Boolean(project));
     },
 
@@ -468,9 +427,7 @@ export function projectService(db: Db) {
       if (!row) return null;
       const [withGoals] = await attachGoals(db, [row]);
       if (!withGoals) return null;
-      const [withWorkspaces] = await attachWorkspaces(db, [withGoals]);
-      if (!withWorkspaces) return null;
-      const [enriched] = await attachAgentIds(db, [withWorkspaces]);
+      const [enriched] = await attachWorkspaces(db, [withGoals]);
       return enriched ?? null;
     },
 
@@ -509,8 +466,7 @@ export function projectService(db: Db) {
       }
 
       const [withGoals] = await attachGoals(db, [row]);
-      const [withWorkspaces] = withGoals ? await attachWorkspaces(db, [withGoals]) : [];
-      const [enriched] = withWorkspaces ? await attachAgentIds(db, [withWorkspaces]) : [];
+      const [enriched] = withGoals ? await attachWorkspaces(db, [withGoals]) : [];
       return enriched!;
     },
 
@@ -563,8 +519,7 @@ export function projectService(db: Db) {
       }
 
       const [withGoals] = await attachGoals(db, [row]);
-      const [withWorkspaces] = withGoals ? await attachWorkspaces(db, [withGoals]) : [];
-      const [enriched] = withWorkspaces ? await attachAgentIds(db, [withWorkspaces]) : [];
+      const [enriched] = withGoals ? await attachWorkspaces(db, [withGoals]) : [];
       return enriched ?? null;
     },
 
@@ -586,7 +541,7 @@ export function projectService(db: Db) {
         .where(eq(projectWorkspaces.projectId, projectId))
         .orderBy(desc(projectWorkspaces.isPrimary), asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id));
       if (rows.length === 0) return [];
-      const runtimeServicesByWorkspaceId = await listWorkspaceRuntimeServicesForProjectWorkspaces(
+      const runtimeServicesByWorkspaceId = await listCurrentRuntimeServicesForProjectWorkspaces(
         db,
         rows[0]!.companyId,
         rows.map((workspace) => workspace.id),
@@ -880,32 +835,6 @@ export function projectService(db: Db) {
       });
 
       return removed ? toWorkspace(removed) : null;
-    },
-
-    listAgentIds: async (projectId: string): Promise<string[]> => {
-      const rows = await db
-        .select({ agentId: projectAgents.agentId })
-        .from(projectAgents)
-        .where(eq(projectAgents.projectId, projectId));
-      return rows.map((r) => r.agentId);
-    },
-
-    addAgent: async (projectId: string, agentId: string) => {
-      await db
-        .insert(projectAgents)
-        .values({ projectId, agentId })
-        .onConflictDoNothing();
-    },
-
-    removeAgent: async (projectId: string, agentId: string) => {
-      await db
-        .delete(projectAgents)
-        .where(
-          and(
-            eq(projectAgents.projectId, projectId),
-            eq(projectAgents.agentId, agentId),
-          ),
-        );
     },
 
     resolveByReference: async (companyId: string, reference: string) => {

@@ -1,5 +1,11 @@
-import type { Agent, Project, ProjectWorkspace, WorkspaceOperation } from "@paperclipai/shared";
+import type {
+  Project,
+  ProjectWorkspace,
+  WorkspaceOperation,
+  WorkspaceRuntimeControlTarget,
+} from "@paperclipai/shared";
 import { api } from "./client";
+import { sanitizeWorkspaceRuntimeControlTarget } from "./workspace-runtime-control";
 
 function withCompanyScope(path: string, companyId?: string) {
   if (!companyId) return path;
@@ -32,18 +38,24 @@ export const projectsApi = {
     workspaceId: string,
     action: "start" | "stop" | "restart",
     companyId?: string,
+    target: WorkspaceRuntimeControlTarget = {},
   ) =>
     api.post<{ workspace: ProjectWorkspace; operation: WorkspaceOperation }>(
       projectPath(projectId, companyId, `/workspaces/${encodeURIComponent(workspaceId)}/runtime-services/${action}`),
-      {},
+      sanitizeWorkspaceRuntimeControlTarget(target),
+    ),
+  controlWorkspaceCommands: (
+    projectId: string,
+    workspaceId: string,
+    action: "start" | "stop" | "restart" | "run",
+    companyId?: string,
+    target: WorkspaceRuntimeControlTarget = {},
+  ) =>
+    api.post<{ workspace: ProjectWorkspace; operation: WorkspaceOperation }>(
+      projectPath(projectId, companyId, `/workspaces/${encodeURIComponent(workspaceId)}/runtime-commands/${action}`),
+      sanitizeWorkspaceRuntimeControlTarget(target),
     ),
   removeWorkspace: (projectId: string, workspaceId: string, companyId?: string) =>
     api.delete<ProjectWorkspace>(projectPath(projectId, companyId, `/workspaces/${encodeURIComponent(workspaceId)}`)),
   remove: (id: string, companyId?: string) => api.delete<Project>(projectPath(id, companyId)),
-  listAgents: (projectId: string, companyId?: string) =>
-    api.get<Agent[]>(projectPath(projectId, companyId, "/agents")),
-  addAgent: (projectId: string, agentId: string, companyId?: string) =>
-    api.post<Project>(projectPath(projectId, companyId, "/agents"), { agentId }),
-  removeAgent: (projectId: string, agentId: string, companyId?: string) =>
-    api.delete<Project>(projectPath(projectId, companyId, `/agents/${encodeURIComponent(agentId)}`)),
 };
